@@ -13,6 +13,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -27,8 +28,6 @@ const (
 	classPath    = "spec.volumeSnapshotClassName"
 )
 
-var volumeGroupSnapshotAPIVersion = groupsnapshotv1.SchemeGroupVersion.String()
-
 func appliesToVolumeSnapshots(body *rules.NamespaceRuleEnforceBody) bool {
 	return body.GetStorageClassTargets(rules.StorageTargetVolumeSnapshot)
 }
@@ -37,6 +36,21 @@ func hasClassRules(bodies []*rules.NamespaceRuleEnforceBody) bool {
 	return slices.ContainsFunc(bodies, func(body *rules.NamespaceRuleEnforceBody) bool {
 		return body != nil && appliesToVolumeSnapshots(body)
 	})
+}
+
+// everyRequest returns the enforcement rules without an audience or
+// conditions. They apply to every request in the namespace, so also to the
+// patch with which the snapshot-controller sets a default class.
+func everyRequest(bodies []*rules.NamespaceRuleBodyNamespace) map[*rules.NamespaceRuleEnforceBody]bool {
+	out := make(map[*rules.NamespaceRuleEnforceBody]bool, len(bodies))
+
+	for _, body := range bodies {
+		if body != nil && body.Enforce != nil && len(body.Audience) == 0 && len(body.Enforce.Conditions) == 0 {
+			out[body.Enforce] = true
+		}
+	}
+
+	return out
 }
 
 // classReader reads the snapshot's VolumeSnapshotClass at most once, and only
@@ -73,13 +87,14 @@ func (c *classReader) get(ctx context.Context) (*snapshotv1.VolumeSnapshotClass,
 
 func (h *volumeSnapshotRules) evaluate(
 	ctx context.Context,
-	obj *snapshotv1.VolumeSnapshot,
+	obj, old *snapshotv1.VolumeSnapshot,
 	classes *classReader,
+	bodies []*rules.NamespaceRuleBodyNamespace,
 	enforce []*rules.NamespaceRuleEnforceBody,
 ) (*ruleengine.Evaluation, error) {
 	name := ptr.Deref(obj.Spec.VolumeSnapshotClassName, "")
 	if name == "" {
-		return missingClass(obj, enforce), nil
+		return missingClass(obj, old, enforce, everyRequest(bodies)), nil
 	}
 
 	return ruleengine.EvaluateEnforce(obj, enforce, ruleengine.Set[rules.StorageClassMatch, *snapshotv1.VolumeSnapshot]{
@@ -129,20 +144,28 @@ func (h *volumeSnapshotRules) evaluate(
 }
 
 // missingClass handles a snapshot without a class like a missing ingress
-// hostname: allow and deny rules reject it, audit rules record it. The
-// snapshot-controller would otherwise set its driver's default class after
-// admission, which no rule has checked.
-func missingClass(obj *snapshotv1.VolumeSnapshot, enforce []*rules.NamespaceRuleEnforceBody) *ruleengine.Evaluation {
+// hostname: allow and deny rules reject it, audit rules record it, because
+// the snapshot-controller would set its driver's default class after
+// admission.
+//
+// A pre-provisioned snapshot never gets a default class. A VolumeGroupSnapshot
+// member doesn't either, but the snapshot-controller only recognizes an owner
+// with its own API version (v1beta1, v1beta2 or v1, depending on its release),
+// and the requester sets the owners. So only rules without an audience or
+// conditions, which also check the patch that sets a default class, let
+// members through, and updates that keep the class missing.
+func missingClass(obj, old *snapshotv1.VolumeSnapshot, enforce []*rules.NamespaceRuleEnforceBody, everyRequest map[*rules.NamespaceRuleEnforceBody]bool) *ruleengine.Evaluation {
 	evaluation := &ruleengine.Evaluation{}
-	if !defaultsClass(obj.Spec.Source.VolumeSnapshotContentName, obj.OwnerReferences) {
+	if obj.Spec.Source.VolumeSnapshotContentName != nil {
 		return evaluation
 	}
 
+	exempt := isVolumeGroupSnapshotMember(obj.OwnerReferences) || (old != nil && old.Spec.VolumeSnapshotClassName == nil)
 	value := ruleengine.Value{Path: classPath}
 	audited, enforced := false, false
 
 	for _, body := range enforce {
-		if body == nil || !appliesToVolumeSnapshots(body) {
+		if body == nil || !appliesToVolumeSnapshots(body) || (exempt && everyRequest[body]) {
 			continue
 		}
 
@@ -176,23 +199,12 @@ func missingClass(obj *snapshotv1.VolumeSnapshot, enforce []*rules.NamespaceRule
 	return evaluation
 }
 
-// defaultsClass reports whether the snapshot-controller assigns a default
-// class to a snapshot without one. It skips pre-provisioned snapshots and the
-// members of a VolumeGroupSnapshot.
-func defaultsClass(contentName *string, owners []metav1.OwnerReference) bool {
-	return contentName == nil && !isVolumeGroupSnapshotMember(owners)
-}
-
-// isVolumeGroupSnapshotMember mirrors the snapshot-controller's own check:
-// the first VolumeGroupSnapshot owner with its API version, v1 since v8.6,
-// decides, and it needs a name. Owners with other versions are not exempt,
-// because a controller that doesn't recognize them defaults the class.
+// isVolumeGroupSnapshotMember reports whether a VolumeGroupSnapshot of any
+// API version owns the snapshot.
 func isVolumeGroupSnapshotMember(owners []metav1.OwnerReference) bool {
-	for _, owner := range owners {
-		if owner.Kind == "VolumeGroupSnapshot" && owner.APIVersion == volumeGroupSnapshotAPIVersion {
-			return owner.Name != ""
-		}
-	}
+	return slices.ContainsFunc(owners, func(owner metav1.OwnerReference) bool {
+		gv, err := schema.ParseGroupVersion(owner.APIVersion)
 
-	return false
+		return err == nil && gv.Group == groupsnapshotv1.GroupName && owner.Kind == "VolumeGroupSnapshot"
+	})
 }

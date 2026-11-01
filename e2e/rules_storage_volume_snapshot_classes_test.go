@@ -64,10 +64,13 @@ var _ = Describe("VolumeSnapshot class rules", Label("tenant", "rules", "storage
 				},
 			}},
 		}
-		deny := rules.NamespaceRuleBodyTenant{NamespaceRuleBodyNamespace: &rules.NamespaceRuleBodyNamespace{Enforce: &rules.NamespaceRuleEnforceBody{
-			Action:  rules.ActionTypeDeny,
-			Storage: rules.NamespaceRuleEnforceStorageBody{Classes: []rules.StorageClassMatch{{Exact: []string{className("gold")}}}},
-		}}}
+		deny := rules.NamespaceRuleBodyTenant{NamespaceRuleBodyNamespace: &rules.NamespaceRuleBodyNamespace{
+			Audience: []rules.Audience{{Kind: rules.AudienceKindCustom, Name: string(rules.CustomAudienceTenantOwner)}},
+			Enforce: &rules.NamespaceRuleEnforceBody{
+				Action:  rules.ActionTypeDeny,
+				Storage: rules.NamespaceRuleEnforceStorageBody{Classes: []rules.StorageClassMatch{{Exact: []string{className("gold")}}}},
+			},
+		}}
 
 		newTenant := func(suffix string, rule rules.NamespaceRuleBodyTenant) *capsule.Tenant {
 			name := prefix + "-" + suffix
@@ -170,10 +173,13 @@ var _ = Describe("VolumeSnapshot class rules", Label("tenant", "rules", "storage
 		preProvisioned.Spec.Source = snapshotv1.VolumeSnapshotSource{VolumeSnapshotContentName: new(prefix + "-content")}
 		admit(ownerA, preProvisioned)
 
-		By("rejecting a snapshot without a class whose group owner the snapshot-controller doesn't recognize")
-		forged := snapshot(restricted, "forged-member", nil)
-		forged.OwnerReferences = []metav1.OwnerReference{{APIVersion: "groupsnapshot.storage.k8s.io/v999", Kind: "VolumeGroupSnapshot", Name: "group", UID: "forged"}}
-		reject(ownerA, forged, required)
+		By("admitting a VolumeGroupSnapshot member, since the rule also checks the class the snapshot-controller sets later")
+		member := func(ns *corev1.Namespace) *snapshotv1.VolumeSnapshot {
+			obj := snapshot(ns, "member", nil)
+			obj.OwnerReferences = []metav1.OwnerReference{{APIVersion: "groupsnapshot.storage.k8s.io/v1", Kind: "VolumeGroupSnapshot", Name: "group", UID: "group"}}
+			return obj
+		}
+		admit(ownerA, member(restricted))
 
 		By("leaving other namespace profiles and tenants to their own rules")
 		admit(ownerA, snapshot(open, "bronze", new(className("bronze"))))
@@ -181,6 +187,9 @@ var _ = Describe("VolumeSnapshot class rules", Label("tenant", "rules", "storage
 		admit(ownerB, snapshot(other, "bronze", new(className("bronze"))))
 		reject(ownerB, snapshot(other, "gold", new(className("gold"))), fmt.Sprintf("volume snapshot class %q at spec.volumeSnapshotClassName is denied by namespace rule", className("gold")))
 		reject(ownerB, snapshot(other, "default", nil), required)
+
+		By("requiring a class from a group member for a rule scoped to tenant owners, which never sees the snapshot-controller's patch")
+		reject(ownerB, member(other), required)
 
 		By("validating class changes on update")
 		changeClass := func(obj *snapshotv1.VolumeSnapshot, class string) error {

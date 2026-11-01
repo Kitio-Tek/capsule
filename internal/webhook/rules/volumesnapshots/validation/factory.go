@@ -11,6 +11,7 @@ import (
 	snapshotv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -67,30 +68,15 @@ type snapshotFields struct {
 		OwnerReferences []metav1.OwnerReference `json:"ownerReferences"`
 	} `json:"metadata"`
 	Spec struct {
-		Source struct {
-			VolumeSnapshotContentName *string `json:"volumeSnapshotContentName"`
-		} `json:"source"`
 		VolumeSnapshotClassName *string `json:"volumeSnapshotClassName"`
 	} `json:"spec"`
-	Status *struct {
-		BoundVolumeSnapshotContentName *string `json:"boundVolumeSnapshotContentName"`
-	} `json:"status"`
 }
 
-func (f *snapshotFields) defaultsClass() bool {
-	return defaultsClass(f.Spec.Source.VolumeSnapshotContentName, f.Metadata.OwnerReferences)
-}
-
-func (f *snapshotFields) bound() bool {
-	return f.Status != nil && ptr.Deref(f.Status.BoundVolumeSnapshotContentName, "") != ""
-}
-
-// classMayChange lets an update through when it changes the class, or when it
-// opens an unbound snapshot without a class to defaulting, for example by
-// removing its VolumeGroupSnapshot owner. Finalizer and label updates, such as
-// the snapshot-controller's, and the garbage collector orphaning a bound group
-// member are skipped. Undecodable payloads continue, so that the typed handler
-// reports them.
+// classMayChange lets an update through when it changes the class, or the
+// owners of a snapshot without a class, from which the snapshot-controller
+// decides whether to default it. Finalizer and label updates, such as the
+// snapshot-controller's, are skipped. Undecodable payloads continue, so that
+// the typed handler reports them.
 func classMayChange(req admission.Request) bool {
 	if req.Operation != admissionv1.Update {
 		return true
@@ -105,23 +91,23 @@ func classMayChange(req admission.Request) bool {
 		return true
 	}
 
-	return current.Spec.VolumeSnapshotClassName == nil && !current.bound() &&
-		current.defaultsClass() && !previous.defaultsClass()
+	return current.Spec.VolumeSnapshotClassName == nil &&
+		!equality.Semantic.DeepEqual(current.Metadata.OwnerReferences, previous.Metadata.OwnerReferences)
 }
 
 func (h *volumeSnapshotRules) OnCreate(_ client.Client, reader client.Reader, obj *snapshotv1.VolumeSnapshot, _ admission.Decoder, recorder events.EventRecorder, tnt *capsulev1beta2.Tenant, bodies []*rules.NamespaceRuleBodyNamespace) handlers.Func {
-	return h.validate(reader, obj, recorder, tnt, bodies)
+	return h.validate(reader, obj, nil, recorder, tnt, bodies)
 }
 
-func (h *volumeSnapshotRules) OnUpdate(_ client.Client, reader client.Reader, _ *snapshotv1.VolumeSnapshot, obj *snapshotv1.VolumeSnapshot, _ admission.Decoder, recorder events.EventRecorder, tnt *capsulev1beta2.Tenant, bodies []*rules.NamespaceRuleBodyNamespace) handlers.Func {
-	return h.validate(reader, obj, recorder, tnt, bodies)
+func (h *volumeSnapshotRules) OnUpdate(_ client.Client, reader client.Reader, old *snapshotv1.VolumeSnapshot, obj *snapshotv1.VolumeSnapshot, _ admission.Decoder, recorder events.EventRecorder, tnt *capsulev1beta2.Tenant, bodies []*rules.NamespaceRuleBodyNamespace) handlers.Func {
+	return h.validate(reader, obj, old, recorder, tnt, bodies)
 }
 
 func (*volumeSnapshotRules) OnDelete(client.Client, client.Reader, *snapshotv1.VolumeSnapshot, admission.Decoder, events.EventRecorder, *capsulev1beta2.Tenant, []*rules.NamespaceRuleBodyNamespace) handlers.Func {
 	return func(context.Context, admission.Request) *admission.Response { return nil }
 }
 
-func (h *volumeSnapshotRules) validate(reader client.Reader, obj *snapshotv1.VolumeSnapshot, recorder events.EventRecorder, tnt *capsulev1beta2.Tenant, bodies []*rules.NamespaceRuleBodyNamespace) handlers.Func {
+func (h *volumeSnapshotRules) validate(reader client.Reader, obj, old *snapshotv1.VolumeSnapshot, recorder events.EventRecorder, tnt *capsulev1beta2.Tenant, bodies []*rules.NamespaceRuleBodyNamespace) handlers.Func {
 	return func(ctx context.Context, req admission.Request) *admission.Response {
 		enforce := ruleengine.EnforceBodiesFromNamespaceRules(bodies)
 		if !hasClassRules(enforce) {
@@ -136,7 +122,7 @@ func (h *volumeSnapshotRules) validate(reader client.Reader, obj *snapshotv1.Vol
 
 		classes := &classReader{reader: reader, name: ptr.Deref(obj.Spec.VolumeSnapshotClassName, "")}
 
-		result, err := h.evaluate(ctx, obj, classes, enforce)
+		result, err := h.evaluate(ctx, obj, old, classes, bodies, enforce)
 		if classes.err != nil {
 			return handlers.ErroredResponse(classes.err)
 		}
