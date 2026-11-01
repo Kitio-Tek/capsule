@@ -221,7 +221,7 @@ var _ = Describe("VolumeSnapshot class rules", Label("tenant", "rules", "storage
 			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(a), current); err != nil {
 				return err
 			}
-			current.Spec.Rules[0].Enforce.Storage.Classes = current.Spec.Rules[0].Enforce.Storage.Classes[1:]
+			current.Spec.Rules[0].Enforce.Storage.Classes = allow.Enforce.Storage.Classes[1:]
 			return k8sClient.Update(ctx, current)
 		}, defaultTimeoutInterval, defaultPollInterval).Should(Succeed())
 		TenantReady(a, metav1.ConditionTrue, defaultTimeoutInterval)
